@@ -17,10 +17,9 @@
 #include <pthread.h>
 #include <pcap/pcap.h>
 #include <errno.h>
-
-
-
-
+#include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <sys/time.h>
 
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025 // Maximum length of a hostname 
@@ -76,23 +75,29 @@ struct packet {
     struct tcphdr tcp;
 };
 
+struct udp_packet {
+    struct iphdr ip;
+    struct udphdr udp;
+};
+
 typedef struct nmap {
     struct interphase reseau;
-    struct packet pkt;
     t_opts opts;
     struct in_addr tip; // target ip
     struct in_addr sip; // source ip
-    uint16_t sport; // source port
-    uint16_t tport; // destination port
-    struct bpf_program fp;
+
     char nb1[7];
     char nb2[7];
     int onePort;
+    struct tcphdr **tcp;
+    struct iphdr **ip;
+    struct udphdr *udp;
+    struct icmphdr *icmp;
 
 } Nmap;
     
-Nmap nmap;
 
+Nmap nmap;
 
 /*
     *@brief: easy if c it's between 0 and 9 c - '0' and if c is between a and f c - 'a' + 10
@@ -242,6 +247,510 @@ int getInterfaceReseau(struct interphase *reseau)
     return 0;
 }
 
+void scanudp(int port)
+{
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    struct udp_packet pkt;
+    struct pseudo_header psh;
+    struct bpf_program fp;
+
+    struct udphdr *udp = NULL;
+    struct iphdr *ip = NULL;
+    struct icmphdr *icmp = NULL;
+
+    memset(&pkt, 0, sizeof(pkt));
+
+    /* configuration IP */
+    pkt.ip.version = 4;
+    pkt.ip.ihl = 5;
+    pkt.ip.tos = 0;
+    pkt.ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr));
+    pkt.ip.protocol = IPPROTO_UDP;
+    pkt.ip.saddr = nmap.sip.s_addr;
+    pkt.ip.daddr = nmap.tip.s_addr;
+    pkt.ip.id = htons(1234);
+    pkt.ip.frag_off = 0;
+    pkt.ip.ttl = 64;
+    pkt.ip.check = checksum(&pkt.ip, sizeof(struct iphdr));
+
+    /* configuration UDP */
+    pkt.udp.source = htons(4242);
+    pkt.udp.dest = htons(port);
+    pkt.udp.len = htons(sizeof(struct udphdr));
+    pkt.udp.check = 0;
+
+    /* pseudo header pour checksum UDP */
+    unsigned char buf[
+        sizeof(struct pseudo_header) +
+        sizeof(struct udphdr)
+    ];
+
+    memset(&psh, 0, sizeof(psh));
+
+    psh.source_address = nmap.sip.s_addr;
+    psh.dest_address = nmap.tip.s_addr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_UDP;
+    psh.tcp_length = htons(sizeof(struct udphdr));
+
+    memcpy(buf, &psh, sizeof(psh));
+    memcpy(buf + sizeof(psh), &pkt.udp, sizeof(struct udphdr));
+
+    pkt.udp.check = checksum(&buf, sizeof(buf));
+
+    int one = 1;
+
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL,
+                   &one, sizeof(one)) < 0)
+    {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    pcap_t *handle = pcap_open_live(
+        nmap.reseau.name,
+        65535,
+        1,
+        1000,
+        errbuf
+    );
+
+    if (handle == NULL)
+    {
+        fprintf(stderr,
+                "Could not open device %s: %s\n",
+                nmap.reseau.name,
+                errbuf);
+        exit(EXIT_FAILURE);
+    }
+
+    char filter_exp[256];
+
+    snprintf(filter_exp, sizeof(filter_exp),
+        "(udp and src host %s and src port %d) "
+        "or (icmp and src host %s)",
+        inet_ntoa(nmap.tip),
+        port,
+        inet_ntoa(nmap.tip));
+
+    pcap_compile(
+        handle,
+        &fp,
+        filter_exp,
+        0,
+        PCAP_NETMASK_UNKNOWN
+    );
+
+    pcap_setfilter(handle, &fp);
+
+    struct sockaddr_in dest_addr;
+
+    memset(&dest_addr, 0, sizeof(dest_addr));
+
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr = nmap.tip;
+
+    ssize_t sent = sendto(
+        sock,
+        &pkt,
+        sizeof(pkt),
+        0,
+        (struct sockaddr *)&dest_addr,
+        sizeof(dest_addr)
+    );
+
+    if (sent < 0)
+    {
+        printf("Error sending packet: %s\n", strerror(errno));
+        perror("sendto");
+        exit(EXIT_FAILURE);
+    }
+
+    struct pcap_pkthdr *header;
+    const u_char *packet;
+    int ret;
+    printf("Waiting for response...\n");
+    while (1)
+    {
+        ret = pcap_next_ex(handle, &header, &packet);
+
+        if (ret == -1)
+        {
+            fprintf(stderr,
+                    "pcap_next_ex: %s\n",
+                    pcap_geterr(handle));
+            exit(EXIT_FAILURE);
+        }
+
+        if (ret == 0)
+        {
+            printf("Timeout\n");
+            break;
+        }
+
+        printf("Packet captured: %u bytes\n",
+               header->caplen);
+
+        if (header->caplen < sizeof(struct ethernet_header))
+            continue;
+
+        struct ethernet_header *eth =
+            (struct ethernet_header *)packet;
+
+        if (ntohs(eth->ethertype) != ETH_P_IP)
+            continue;
+
+        if (header->caplen <
+            sizeof(struct ethernet_header) +
+            sizeof(struct iphdr))
+            continue;
+
+        ip = (struct iphdr *)(
+            packet + sizeof(struct ethernet_header)
+        );
+
+        printf("IP version = %u\n", ip->version);
+        printf("IP header length = %u bytes\n",
+               ip->ihl * 4);
+        printf("IP protocol = %u\n", ip->protocol);
+
+        /*
+         * Réponse UDP
+         */
+        if (ip->protocol == IPPROTO_UDP)
+        {
+            if (header->caplen <
+                sizeof(struct ethernet_header) +
+                ip->ihl * 4 +
+                sizeof(struct udphdr))
+                continue;
+
+            udp = (struct udphdr *)(
+                (unsigned char *)ip +
+                ip->ihl * 4
+            );
+
+            struct in_addr packet_src;
+            struct in_addr packet_dst;
+
+            packet_src.s_addr = ip->saddr;
+            packet_dst.s_addr = ip->daddr;
+
+            printf("packet src = %s\n",
+                   inet_ntoa(packet_src));
+
+            printf("packet dst = %s\n",
+                   inet_ntoa(packet_dst));
+
+            printf("UDP src port = %u\n",
+                   ntohs(udp->source));
+
+            printf("UDP dst port = %u\n",
+                   ntohs(udp->dest));
+
+            break;
+        }
+
+        /*
+         * Réponse ICMP
+         */
+        if (ip->protocol == IPPROTO_ICMP)
+        {
+            if (header->caplen <
+                sizeof(struct ethernet_header) +
+                ip->ihl * 4 +
+                sizeof(struct icmphdr))
+                continue;
+
+            icmp =
+                (struct icmphdr *)(
+                    (unsigned char *)ip +
+                    ip->ihl * 4
+                );
+
+            printf("ICMP type = %u\n", icmp->type);
+            printf("ICMP code = %u\n", icmp->code);
+
+            if (icmp->type == ICMP_DEST_UNREACH &&
+                icmp->code == ICMP_PORT_UNREACH)
+            {
+                printf("UDP port %d is CLOSED\n", port);
+                break;
+            }
+        }
+    }
+ //   memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
+   // memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
+    pcap_close(handle);
+    close(sock);
+}
+
+void scantcp(int port, int scan) 
+{
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    struct packet pkt;
+    // int sock2 = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    struct pseudo_header psh;
+    memset(&pkt, 0, sizeof(pkt));
+    struct bpf_program fp;
+    struct tcphdr *tcp;
+    struct iphdr *ip;   
+    
+    
+// configure IP
+    pkt.ip.version = 4; // IPv4
+    pkt.ip.ihl = 5; // header length
+    pkt.ip.tos = 0;
+    pkt.ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+    pkt.ip.protocol = IPPROTO_TCP;
+    pkt.ip.saddr = nmap.sip.s_addr;
+    pkt.ip.daddr = nmap.tip.s_addr;
+    pkt.ip.id = htons(1234);
+    pkt.ip.frag_off = 0;
+    pkt.ip.ttl = 64;
+    pkt.ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+    pkt.ip.check = checksum(&pkt.ip, sizeof(struct iphdr));
+
+// configure tcp 
+    pkt.tcp.source = htons(4242); // source port
+   // nmap.pkt.tcp.dest = htons(atoi(nmap.opts.port)); // destination port
+    pkt.tcp.dest = htons(port);
+    pkt.tcp.seq = htonl(0);
+    pkt.tcp.ack_seq = htonl(0);
+    pkt.tcp.doff = 5; // data offset
+    pkt.tcp.window = htons(5840); // maximum allowed window size
+    pkt.tcp.check = 0; // checksum (will be calculated later
+    pkt.tcp.urg_ptr = 0;
+    
+    if (scan == 1)
+        pkt.tcp.syn = 1; // SYN flag
+    else if (scan == 2)
+        pkt.tcp.fin = 1; // FIN flag
+
+    else if (scan == 4)
+    {
+        pkt.tcp.fin = 1; // FIN flag
+        pkt.tcp.psh = 1; // PSH flag
+        pkt.tcp.urg = 1; // URG flag
+    }
+    else if (scan == 5)
+        pkt.tcp.ack = 1; // ACK flag
+    else if (scan == 6)
+        pkt.tcp.rst = 1; // RST flag
+
+
+// config pseudo header
+    unsigned char buf[sizeof(struct pseudo_header) + sizeof(struct tcphdr)];
+
+    memset(&psh, 0, sizeof(psh));
+
+    psh.source_address = nmap.sip.s_addr;
+    psh.dest_address   = nmap.tip.s_addr;
+    psh.placeholder    = 0;
+    psh.protocol       = IPPROTO_TCP;
+    psh.tcp_length     = htons(sizeof(struct tcphdr));
+
+    memcpy(buf, &psh, sizeof(psh));
+    memcpy(buf + sizeof(psh), &pkt.tcp, sizeof(struct tcphdr));
+    pkt.tcp.check = checksum(&buf, sizeof(buf));
+
+    int one = 1;
+
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL,
+                &one, sizeof(one)) < 0) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+        pcap_t *handle = pcap_open_live(
+        nmap.reseau.name,
+        65535, // snaplen
+        1,  // promisc
+        1000, // timeout in ms
+        errbuf
+    );
+
+    if (handle == NULL) {
+        fprintf(stderr, "Could not open device %s: %s\n", nmap.reseau.name, errbuf);
+        exit(EXIT_FAILURE);
+    }
+
+    char filter_exp[256];
+
+    snprintf(filter_exp, sizeof(filter_exp),
+        "tcp and src host %s and src port %d",
+        inet_ntoa(nmap.tip),
+    ntohs(pkt.tcp.dest));
+    pcap_compile(
+        handle,
+        &fp,
+        filter_exp,
+        0,
+        PCAP_NETMASK_UNKNOWN // mask no correctly connection
+    );
+
+    pcap_setfilter(handle, &fp);
+
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr = nmap.tip;
+
+    ssize_t sent =  sendto(sock, &pkt, sizeof(pkt), 0,
+           (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    
+    if (sent < 0) {
+        printf("Error sending packet: %s\n", strerror(errno));
+        perror("sendto");
+        exit(EXIT_FAILURE);
+    }
+
+    struct pcap_pkthdr *header;
+    const u_char *packet;
+    int ret;
+
+    while (1)
+    {
+        ret = pcap_next_ex(handle, &header, &packet);
+
+        if (ret == -1)
+        {
+            fprintf(stderr, "pcap_next_ex: %s\n",
+                    pcap_geterr(handle));
+            exit(EXIT_FAILURE);
+        }
+
+        if (ret == 0)
+        {
+            printf("Timeout\n");
+            break;
+        }
+
+        printf("Packet captured: %u bytes\n", header->caplen);
+
+        if (header->caplen < sizeof(struct ethernet_header))
+            continue;
+
+        struct ethernet_header *eth =
+            (struct ethernet_header *)packet;
+
+        if (ntohs(eth->ethertype) != ETH_P_IP)
+            continue;
+
+        if (header->caplen <
+            sizeof(struct ethernet_header) + sizeof(struct iphdr))
+            continue;
+
+        ip =
+            (struct iphdr *)(packet + sizeof(struct ethernet_header));
+
+        printf("IP version = %u\n", ip->version);
+        printf("IP header length = %u bytes\n", ip->ihl * 4);
+        printf("IP protocol = %u\n", ip->protocol);
+
+        if (ip->protocol != IPPROTO_TCP)
+            continue;
+
+        if (header->caplen <
+            sizeof(struct ethernet_header)
+            + ip->ihl * 4
+            + sizeof(struct tcphdr))
+            continue;
+
+        tcp =
+            (struct tcphdr *)((unsigned char *)ip + ip->ihl * 4);
+
+        struct in_addr packet_src;
+        struct in_addr packet_dst;
+
+        packet_src.s_addr = ip->saddr;
+        packet_dst.s_addr = ip->daddr;
+
+        printf("packet src = %s\n", inet_ntoa(packet_src));
+        printf("packet dst = %s\n", inet_ntoa(packet_dst));
+
+        printf("TCP src port = %u\n", ntohs(tcp->source));
+        printf("TCP dst port = %u\n", ntohs(tcp->dest));
+
+        printf("SYN = %u\n", tcp->syn);
+        printf("ACK = %u\n", tcp->ack);
+        printf("RST = %u\n", tcp->rst);
+
+        break;
+    }
+    int index = port - atoi(nmap.nb1);
+
+    
+    memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
+    memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
+    pcap_close(handle);
+    close(sock);
+}
+/*
+void * workers(void *arg)
+{
+    int *port = (int*) arg;
+    if (nmap.opts.scan == NULL)
+    {
+        scantcp(*port + atoi(nmap.nb1), 1);
+    }
+    else if (strcmp(nmap.opts.scan, "SYN") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 1);
+    }
+    else if (strcmp(nmap.opts.scan, "FIN") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 2);
+    }
+    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 3);
+    }
+    else if (strcmp(nmap.opts.scan, "XMAS") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 4);
+    }
+    else if (strcmp(nmap.opts.scan, "ACK") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 5);
+    }
+    else if (strcmp(nmap.opts.scan, "UDP") == 0)
+    {
+        scantcp(*port + atoi(nmap.nb1), 6);
+    }
+
+}*/
+
+void scanManager(Nmap nmap)
+{
+    pthread_t threads[250];
+
+  //  nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
+    //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
+   // Nmap nm[250];
+    int j = 0;
+    if (nmap.onePort == 0)
+    {
+        for (int i = 0; i < nmap.opts.port; i++)
+        {
+                nmap.tcp[i - atoi(nmap.nb1)] = malloc(sizeof(struct tcphdr) * 6);
+                nmap.ip[i - atoi(nmap.nb1)] = malloc(sizeof(struct iphdr) * 6 );
+            //thread create
+            if (j == 250)
+            {
+                j = 0;
+                for (int k = 0; k < nmap.opts.speedUp; k++)
+                {
+                    pthread_join(threads[k], NULL);
+                }
+            }
+        }
+    }
+}
+
 void print_help(void)
 {
     printf("ft_nmap [OPTIONS]\n");
@@ -261,9 +770,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "Erreur: ce programme doit être exécuté en root.\n");
         return 1;
     }
-
     nmap.opts.speedUp = 0;
-    nmap.onePort = 0;
+    nmap.onePort = -1;
+    nmap.opts.scan = NULL;
     if (argc < 2) {
         print_help();
         return 0;
@@ -289,10 +798,11 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "--ports") == 0 && i + 1 < argc)
             {
+                nmap.onePort = 0;
                 int index = 0;
                 if (argv[i+1][index] == '-')
                 {
-                    printf("Port: bad arg\n;");
+                    printf("Port: bad port arg\n;");
                     return -1;
                 }
                 while (argv[i+1][index] != '-' && argv[i+1][index] != '\0')
@@ -305,23 +815,37 @@ int main(int argc, char **argv)
                 {
                     nmap.opts.port = atoi(nmap.nb1);
                     nmap.onePort = nmap.opts.port;
-                    break;  
-                }  
+                    nmap.ip = malloc(sizeof(struct iphdr*) * 1);
+                    nmap.tcp = malloc(sizeof(struct tcphdr*) * 1);
+                    break;
+                }
                 index++; 
                 int i1 = 0;
+
                 while (argv[i+1][index] != '\0')
                 {
                     nmap.nb2[i1] = argv[i+1][index];
                     index++;
                     i1++;
                 }
+
                 nmap.nb2[i1] = 0;
                 nmap.opts.port = atoi(nmap.nb2) - atoi(nmap.nb1);
+
                 if (nmap.opts.port < 0)
                 {
-                    printf("Port: bad arg\n;");
+                    printf("Port: bad port arg\n;");
                     return -1;
                 }
+
+                if (nmap.opts.port > 1024)
+                {
+                    printf("Port: bad port arg\n;");
+                    return -1;
+                }
+
+                nmap.ip = malloc(sizeof(struct iphdr*) * nmap.opts.port);
+                nmap.tcp = malloc(sizeof(struct tcphdr*) * nmap.opts.port);
                 i++;
             }
             else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc)
@@ -344,7 +868,17 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "--scan") == 0 && i + 1 < argc)
             {
+                if (strcmp(argv[i + 1], "SYN") == 0 || strcmp(argv[i + 1], "NUL") == 0 || 
+                strcmp(argv[i + 1], "FIN") == 0 || strcmp(argv[i + 1], "XMAS") == 0 || 
+                    strcmp(argv[i + 1], "ACK") == 0 || strcmp(argv[i + 1], "UDP") == 0)
+                    nmap.opts.scan = argv[i + 1];
+                else
+                {
+                    printf("scan: bad arg\n");
+                    return -1;
+                }
                 nmap.opts.scan = argv[i + 1];
+                
                 i++;
             }
             else if (strcmp(argv[1], "--help") == 0) {
@@ -353,179 +887,19 @@ int main(int argc, char **argv)
             }
         }
     }
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-   // int sock2 = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+
     getInterfaceReseau(&nmap.reseau);
     inet_pton(AF_INET, nmap.reseau.ip, &nmap.sip); // source ip
-    struct pseudo_header psh;
-    memset(&nmap.pkt, 0, sizeof(nmap.pkt));
-    
-    
-// configure IP
-    nmap.pkt.ip.version = 4; // IPv4
-    nmap.pkt.ip.ihl = 5; // header length
-    nmap.pkt.ip.tos = 0;
-    nmap.pkt.ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
-    nmap.pkt.ip.protocol = IPPROTO_TCP;
-    nmap.pkt.ip.saddr = nmap.sip.s_addr;
-    nmap.pkt.ip.daddr = nmap.tip.s_addr;
-    nmap.pkt.ip.id = htons(1234);
-    nmap.pkt.ip.frag_off = 0;
-    nmap.pkt.ip.ttl = 64;
-    nmap.pkt.ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
-    nmap.pkt.ip.check = checksum(&nmap.pkt.ip, sizeof(struct iphdr));
-    
-// configure tcp 
-    nmap.pkt.tcp.source = htons(4242); // source port
-   // nmap.pkt.tcp.dest = htons(atoi(nmap.opts.port)); // destination port
-    nmap.pkt.tcp.dest = htons(42);
-    nmap.pkt.tcp.seq = htonl(0);
-    nmap.pkt.tcp.ack_seq = htonl(0);
-    nmap.pkt.tcp.doff = 5; // data offset
-    nmap.pkt.tcp.window = htons(5840); // maximum allowed window size
-    nmap.pkt.tcp.check = 0; // checksum (will be calculated later
-    nmap.pkt.tcp.urg_ptr = 0;
-    nmap.pkt.tcp.syn = 1; // SYN flag
-
-// config pseudo header
-    unsigned char buf[sizeof(struct pseudo_header) + sizeof(struct tcphdr)];
-
-    memset(&psh, 0, sizeof(psh));
-
-    psh.source_address = nmap.sip.s_addr;
-    psh.dest_address   = nmap.tip.s_addr;
-    psh.placeholder    = 0;
-    psh.protocol       = IPPROTO_TCP;
-    psh.tcp_length     = htons(sizeof(struct tcphdr));
-
-    memcpy(buf, &psh, sizeof(psh));
-    memcpy(buf + sizeof(psh), &nmap.pkt.tcp, sizeof(struct tcphdr));
-    nmap.pkt.tcp.check = checksum(&buf, sizeof(buf));
-
-    int one = 1;
-
-    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL,
-                &one, sizeof(one)) < 0) {
-        perror("setsockopt");
-        return 1;
-    }
-
-    char errbuf[PCAP_ERRBUF_SIZE];
-        pcap_t *handle = pcap_open_live(
-        nmap.reseau.name,
-        65535, // snaplen
-        1,  // promisc
-        1000, // timeout in ms
-        errbuf
-    );
-
-    if (handle == NULL) {
-        fprintf(stderr, "Could not open device %s: %s\n", nmap.reseau.name, errbuf);
-        return 1;
-    }
-
-    char filter_exp[256];
-
-    snprintf(filter_exp, sizeof(filter_exp),
-        "tcp and src host %s and src port %d",
-        inet_ntoa(nmap.tip),
-    ntohs(nmap.pkt.tcp.dest));
-    pcap_compile(
-        handle,
-        &nmap.fp,
-        filter_exp,
-        0,
-        PCAP_NETMASK_UNKNOWN // mask no correctly connection
-    );
-
-    pcap_setfilter(handle, &nmap.fp);
-
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_addr = nmap.tip;
-
-    ssize_t sent =  sendto(sock, &nmap.pkt, sizeof(nmap.pkt), 0,
-           (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    
-    if (sent < 0) {
-        printf("Error sending packet: %s\n", strerror(errno));
-        perror("sendto");
-        return 1;
-    }
-
-    struct pcap_pkthdr *header;
-    const u_char *packet;
-    int ret;
-
-    while (1)
-    {
-        ret = pcap_next_ex(handle, &header, &packet);
-
-        if (ret == -1)
-        {
-            fprintf(stderr, "pcap_next_ex: %s\n",
-                    pcap_geterr(handle));
-            return 1;
-        }
-
-        if (ret == 0)
-        {
-            printf("Timeout\n");
-            break;
-        }
-
-        printf("Packet captured: %u bytes\n", header->caplen);
-
-        if (header->caplen < sizeof(struct ethernet_header))
-            continue;
-
-        struct ethernet_header *eth =
-            (struct ethernet_header *)packet;
-
-        if (ntohs(eth->ethertype) != ETH_P_IP)
-            continue;
-
-        if (header->caplen <
-            sizeof(struct ethernet_header) + sizeof(struct iphdr))
-            continue;
-
-        struct iphdr *ip =
-            (struct iphdr *)(packet + sizeof(struct ethernet_header));
-
-        printf("IP version = %u\n", ip->version);
-        printf("IP header length = %u bytes\n", ip->ihl * 4);
-        printf("IP protocol = %u\n", ip->protocol);
-
-        if (ip->protocol != IPPROTO_TCP)
-            continue;
-
-        if (header->caplen <
-            sizeof(struct ethernet_header)
-            + ip->ihl * 4
-            + sizeof(struct tcphdr))
-            continue;
-
-        struct tcphdr *tcp =
-            (struct tcphdr *)((unsigned char *)ip + ip->ihl * 4);
-
-        struct in_addr packet_src;
-        struct in_addr packet_dst;
-
-        packet_src.s_addr = ip->saddr;
-        packet_dst.s_addr = ip->daddr;
-
-        printf("packet src = %s\n", inet_ntoa(packet_src));
-        printf("packet dst = %s\n", inet_ntoa(packet_dst));
-
-        printf("TCP src port = %u\n", ntohs(tcp->source));
-        printf("TCP dst port = %u\n", ntohs(tcp->dest));
-
-        printf("SYN = %u\n", tcp->syn);
-        printf("ACK = %u\n", tcp->ack);
-        printf("RST = %u\n", tcp->rst);
-
-        break;
-    }
+    nmap.tcp[0] = malloc(sizeof(struct tcphdr) * 6);
+    nmap.ip[0] = malloc(sizeof(struct iphdr) * 6 );
+    scantcp(42, 1);
+   // nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
+    //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
+    printf("Scanning UDP port 42...\n");
+    scanudp(42);
     hex_value('F');
+    free(nmap.ip);
+    free(nmap.tcp);
+    free(nmap.udp);
+    free(nmap.icmp);
 }
