@@ -93,6 +93,7 @@ typedef struct nmap {
     struct iphdr **ip;
     struct udphdr *udp;
     struct icmphdr *icmp;
+    long **time;
 
 } Nmap;
     
@@ -250,6 +251,13 @@ int getInterfaceReseau(struct interphase *reseau)
 void scanudp(int port)
 {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+
+    if (sock < 0)
+    {
+        perror("socket");
+        return;
+    }
+
     struct udp_packet pkt;
     struct pseudo_header psh;
     struct bpf_program fp;
@@ -260,7 +268,7 @@ void scanudp(int port)
 
     memset(&pkt, 0, sizeof(pkt));
 
-    /* configuration IP */
+
     pkt.ip.version = 4;
     pkt.ip.ihl = 5;
     pkt.ip.tos = 0;
@@ -271,15 +279,17 @@ void scanudp(int port)
     pkt.ip.id = htons(1234);
     pkt.ip.frag_off = 0;
     pkt.ip.ttl = 64;
+    pkt.ip.check = 0;
+
     pkt.ip.check = checksum(&pkt.ip, sizeof(struct iphdr));
 
-    /* configuration UDP */
     pkt.udp.source = htons(4242);
     pkt.udp.dest = htons(port);
     pkt.udp.len = htons(sizeof(struct udphdr));
     pkt.udp.check = 0;
 
-    /* pseudo header pour checksum UDP */
+    // check sum
+
     unsigned char buf[
         sizeof(struct pseudo_header) +
         sizeof(struct udphdr)
@@ -296,7 +306,8 @@ void scanudp(int port)
     memcpy(buf, &psh, sizeof(psh));
     memcpy(buf + sizeof(psh), &pkt.udp, sizeof(struct udphdr));
 
-    pkt.udp.check = checksum(&buf, sizeof(buf));
+    pkt.udp.check = checksum(buf, sizeof(buf));
+
 
     int one = 1;
 
@@ -304,8 +315,10 @@ void scanudp(int port)
                    &one, sizeof(one)) < 0)
     {
         perror("setsockopt");
-        exit(EXIT_FAILURE);
+        close(sock);
+        return;
     }
+
 
     char errbuf[PCAP_ERRBUF_SIZE];
 
@@ -313,7 +326,7 @@ void scanudp(int port)
         nmap.reseau.name,
         65535,
         1,
-        1000,
+        100,
         errbuf
     );
 
@@ -323,27 +336,66 @@ void scanudp(int port)
                 "Could not open device %s: %s\n",
                 nmap.reseau.name,
                 errbuf);
-        exit(EXIT_FAILURE);
+        close(sock);
+        return;
     }
+
+    // filtre udp and icmp
 
     char filter_exp[256];
 
-    snprintf(filter_exp, sizeof(filter_exp),
+    snprintf(
+        filter_exp,
+        sizeof(filter_exp),
         "(udp and src host %s and src port %d) "
         "or (icmp and src host %s)",
         inet_ntoa(nmap.tip),
         port,
-        inet_ntoa(nmap.tip));
+        inet_ntoa(nmap.tip)
+    );
 
-    pcap_compile(
+    if (pcap_compile(
         handle,
         &fp,
         filter_exp,
         0,
-        PCAP_NETMASK_UNKNOWN
-    );
+        PCAP_NETMASK_UNKNOWN) == -1)
+    {
+        fprintf(stderr,
+                "pcap_compile: %s\n",
+                pcap_geterr(handle));
 
-    pcap_setfilter(handle, &fp);
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
+
+    if (pcap_setfilter(handle, &fp) == -1)
+    {
+        fprintf(stderr,
+                "pcap_setfilter: %s\n",
+                pcap_geterr(handle));
+
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
+
+    pcap_freecode(&fp);
+
+    
+    if (pcap_setnonblock(handle, 1, errbuf) == -1)
+    {
+        fprintf(stderr,
+                "pcap_setnonblock: %s\n",
+                errbuf);
+
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
+    // send
 
     struct sockaddr_in dest_addr;
 
@@ -363,35 +415,56 @@ void scanudp(int port)
 
     if (sent < 0)
     {
-        printf("Error sending packet: %s\n", strerror(errno));
         perror("sendto");
-        exit(EXIT_FAILURE);
+        pcap_close(handle);
+        close(sock);
+        return;
     }
 
-    struct pcap_pkthdr *header;
-    const u_char *packet;
-    int ret;
     printf("Waiting for response...\n");
+
+
+    struct timeval start;
+    struct timeval now;
+    long elapsed_ms;
+    gettimeofday(&start, NULL);
+
     while (1)
     {
-        ret = pcap_next_ex(handle, &header, &packet);
+        gettimeofday(&now, NULL);
+
+        elapsed_ms =
+            (now.tv_sec - start.tv_sec) * 1000L +
+            (now.tv_usec - start.tv_usec) / 1000L;
+
+        if (elapsed_ms >= 1000)
+        {
+            printf("UDP port %d is OPEN|FILTERED\n", port);
+            break;
+        }
+
+        struct pcap_pkthdr *header;
+        const u_char *packet;
+
+        int ret = pcap_next_ex(
+            handle,
+            &header,
+            &packet
+        );
 
         if (ret == -1)
         {
             fprintf(stderr,
                     "pcap_next_ex: %s\n",
                     pcap_geterr(handle));
-            exit(EXIT_FAILURE);
+            break;
         }
 
         if (ret == 0)
         {
-            printf("Timeout\n");
-            break;
+            usleep(10000);
+            continue;
         }
-
-        printf("Packet captured: %u bytes\n",
-               header->caplen);
 
         if (header->caplen < sizeof(struct ethernet_header))
             continue;
@@ -405,84 +478,149 @@ void scanudp(int port)
         if (header->caplen <
             sizeof(struct ethernet_header) +
             sizeof(struct iphdr))
+        {
+            continue;
+        }
+
+        ip = (struct iphdr *)
+            (packet + sizeof(struct ethernet_header));
+
+        if (ip->version != 4)
             continue;
 
-        ip = (struct iphdr *)(
-            packet + sizeof(struct ethernet_header)
-        );
+        if (ip->ihl < 5)
+            continue;
 
-        printf("IP version = %u\n", ip->version);
-        printf("IP header length = %u bytes\n",
-               ip->ihl * 4);
-        printf("IP protocol = %u\n", ip->protocol);
+        size_t ip_len = ip->ihl * 4;
 
-        /*
-         * Réponse UDP
-         */
+        if (header->caplen <
+            sizeof(struct ethernet_header) +
+            ip_len)
+        {
+            continue;
+        }
+
+        // rep udp
+
         if (ip->protocol == IPPROTO_UDP)
         {
             if (header->caplen <
                 sizeof(struct ethernet_header) +
-                ip->ihl * 4 +
+                ip_len +
                 sizeof(struct udphdr))
+            {
+                continue;
+            }
+
+            udp = (struct udphdr *)
+                ((unsigned char *)ip + ip_len);
+
+            
+            if (ntohs(udp->source) != port)
                 continue;
 
-            udp = (struct udphdr *)(
-                (unsigned char *)ip +
-                ip->ihl * 4
-            );
+            if (ntohs(udp->dest) != 4242)
+                continue;
 
-            struct in_addr packet_src;
-            struct in_addr packet_dst;
-
-            packet_src.s_addr = ip->saddr;
-            packet_dst.s_addr = ip->daddr;
-
-            printf("packet src = %s\n",
-                   inet_ntoa(packet_src));
-
-            printf("packet dst = %s\n",
-                   inet_ntoa(packet_dst));
-
-            printf("UDP src port = %u\n",
-                   ntohs(udp->source));
-
-            printf("UDP dst port = %u\n",
-                   ntohs(udp->dest));
+            printf("UDP port %d is OPEN\n", port);
 
             break;
         }
 
-        /*
-         * Réponse ICMP
-         */
+        // icmp rrep
+
         if (ip->protocol == IPPROTO_ICMP)
         {
             if (header->caplen <
                 sizeof(struct ethernet_header) +
-                ip->ihl * 4 +
+                ip_len +
                 sizeof(struct icmphdr))
+            {
+                continue;
+            }
+
+            icmp = (struct icmphdr *)
+                ((unsigned char *)ip + ip_len);
+
+            /*
+             * On ne s'intéresse ici qu'au
+             * ICMP Destination Unreachable.
+             */
+            if (icmp->type != ICMP_DEST_UNREACH)
                 continue;
 
-            icmp =
-                (struct icmphdr *)(
-                    (unsigned char *)ip +
-                    ip->ihl * 4
-                );
+            if (icmp->code != ICMP_PORT_UNREACH)
+                continue;
 
-            printf("ICMP type = %u\n", icmp->type);
-            printf("ICMP code = %u\n", icmp->code);
+            /*
+             * Un paquet ICMP error contient
+             * l'ancien paquet IP + les premiers
+             * octets du paquet UDP.
+             */
 
-            if (icmp->type == ICMP_DEST_UNREACH &&
-                icmp->code == ICMP_PORT_UNREACH)
+            unsigned char *inner =
+                (unsigned char *)icmp +
+                sizeof(struct icmphdr);
+
+            if (header->caplen <
+                sizeof(struct ethernet_header) +
+                ip_len +
+                sizeof(struct icmphdr) +
+                sizeof(struct iphdr))
             {
-                printf("UDP port %d is CLOSED\n", port);
-                break;
+                continue;
             }
+
+            struct iphdr *inner_ip =
+                (struct iphdr *)inner;
+
+            if (inner_ip->version != 4)
+                continue;
+
+            if (inner_ip->ihl < 5)
+                continue;
+
+            size_t inner_ip_len =
+                inner_ip->ihl * 4;
+
+            if (inner_ip->protocol != IPPROTO_UDP)
+                continue;
+
+            if (inner_ip->saddr != nmap.sip.s_addr)
+                continue;
+
+            if (inner_ip->daddr != nmap.tip.s_addr)
+                continue;
+
+            if (header->caplen <
+                sizeof(struct ethernet_header) +
+                ip_len +
+                sizeof(struct icmphdr) +
+                inner_ip_len +
+                sizeof(struct udphdr))
+            {
+                continue;
+            }
+
+            struct udphdr *inner_udp =
+                (struct udphdr *)
+                ((unsigned char *)inner_ip +
+                 inner_ip_len);
+
+            if (ntohs(inner_udp->source) != 4242)
+                continue;
+
+            if (ntohs(inner_udp->dest) != port)
+                continue;
+
+            printf("UDP port %d is CLOSED\n", port);
+
+            break;
         }
     }
- //   memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
-   // memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
+    //nmap.time[port - atoi(nmap.nb1)][5] = elapsed_ms;
+   // memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
+    //memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
     pcap_close(handle);
     close(sock);
 }
@@ -611,7 +749,7 @@ void scantcp(int port, int scan)
     struct pcap_pkthdr *header;
     const u_char *packet;
     int ret;
-
+    printf("Waiting for response...\n");
     while (1)
     {
         ret = pcap_next_ex(handle, &header, &packet);
@@ -678,24 +816,32 @@ void scantcp(int port, int scan)
         printf("SYN = %u\n", tcp->syn);
         printf("ACK = %u\n", tcp->ack);
         printf("RST = %u\n", tcp->rst);
+        
 
         break;
     }
     int index = port - atoi(nmap.nb1);
-
-    
-    memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
-    memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
+    printf("after while\n");
+    //nmap.time[index][scan - 1] = ret;
+    printf("Time recorded: %ld\n", nmap.time[index][scan - 1]);
+   // memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
+    //memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
     pcap_close(handle);
     close(sock);
 }
-/*
+
 void * workers(void *arg)
 {
     int *port = (int*) arg;
     if (nmap.opts.scan == NULL)
     {
+        printf("all scn\n");
         scantcp(*port + atoi(nmap.nb1), 1);
+        scantcp(*port + atoi(nmap.nb1), 2);
+        scantcp(*port + atoi(nmap.nb1), 3);
+        scantcp(*port + atoi(nmap.nb1), 4);
+        scantcp(*port + atoi(nmap.nb1), 5);
+        scanudp(*port + atoi(nmap.nb1));
     }
     else if (strcmp(nmap.opts.scan, "SYN") == 0)
     {
@@ -719,18 +865,20 @@ void * workers(void *arg)
     }
     else if (strcmp(nmap.opts.scan, "UDP") == 0)
     {
-        scantcp(*port + atoi(nmap.nb1), 6);
+        scanudp(*port + atoi(nmap.nb1));
     }
+    return NULL;
+}
 
-}*/
-
-void scanManager(Nmap nmap)
+void scanManager()
 {
     pthread_t threads[250];
 
   //  nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
     //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
    // Nmap nm[250];
+    nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
+    nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
     int j = 0;
     if (nmap.onePort == 0)
     {
@@ -738,7 +886,7 @@ void scanManager(Nmap nmap)
         {
                 nmap.tcp[i - atoi(nmap.nb1)] = malloc(sizeof(struct tcphdr) * 6);
                 nmap.ip[i - atoi(nmap.nb1)] = malloc(sizeof(struct iphdr) * 6 );
-            //thread create
+                nmap.time[i - atoi(nmap.nb1)] = malloc(sizeof(long) * 6);
             if (j == 250)
             {
                 j = 0;
@@ -748,6 +896,15 @@ void scanManager(Nmap nmap)
                 }
             }
         }
+    }
+    else 
+    {
+        nmap.tcp[0] = malloc(sizeof(struct tcphdr) * 6);
+        nmap.ip[0] = malloc(sizeof(struct iphdr) * 6 );
+        nmap.time[0] = malloc(sizeof(long) * 6);
+        printf("one = %d", nmap.onePort - atoi(nmap.nb1));
+        int p = 0;
+        workers(&p);
     }
 }
 
@@ -817,6 +974,7 @@ int main(int argc, char **argv)
                     nmap.onePort = nmap.opts.port;
                     nmap.ip = malloc(sizeof(struct iphdr*) * 1);
                     nmap.tcp = malloc(sizeof(struct tcphdr*) * 1);
+                    nmap.time = malloc(sizeof(long*) * 1);
                     break;
                 }
                 index++; 
@@ -846,6 +1004,7 @@ int main(int argc, char **argv)
 
                 nmap.ip = malloc(sizeof(struct iphdr*) * nmap.opts.port);
                 nmap.tcp = malloc(sizeof(struct tcphdr*) * nmap.opts.port);
+                nmap.time = malloc(sizeof(long*) * nmap.opts.port);
                 i++;
             }
             else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc)
@@ -890,13 +1049,9 @@ int main(int argc, char **argv)
 
     getInterfaceReseau(&nmap.reseau);
     inet_pton(AF_INET, nmap.reseau.ip, &nmap.sip); // source ip
-    nmap.tcp[0] = malloc(sizeof(struct tcphdr) * 6);
-    nmap.ip[0] = malloc(sizeof(struct iphdr) * 6 );
-    scantcp(42, 1);
-   // nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
-    //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
-    printf("Scanning UDP port 42...\n");
-    scanudp(42);
+    if (nmap.onePort == -1)
+        nmap.onePort = 42;
+    scanManager();
     hex_value('F');
     free(nmap.ip);
     free(nmap.tcp);
