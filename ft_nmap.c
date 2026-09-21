@@ -29,15 +29,6 @@
 #define NI_NUMERICHOST 1
 #endif
 
-#define TCP_FIN 0x01
-#define TCP_SYN 0x02
-#define TCP_RST 0x04
-#define TCP_PSH 0x08
-#define TCP_ACK 0x10
-#define TCP_URG 0x20
-#define TCP_ECE 0x40
-#define TCP_CWR 0x80
-
 struct pseudo_header {
     uint32_t source_address;
     uint32_t dest_address;
@@ -96,8 +87,30 @@ typedef struct nmap {
     long **time;
 
 } Nmap;
-    
 
+enum e_result
+{
+    RESULT_NONE,
+    RESULT_OPEN,
+    RESULT_CLOSED,
+    RESULT_FILTERED,
+    RESULT_OPEN_FILTERED,
+    RESULT_UNFILTERED
+};
+
+typedef struct s_port_result
+{
+    int port;
+
+    enum e_result syn;
+    enum e_result fin;
+    enum e_result nul;
+    enum e_result xmas;
+    enum e_result ack;
+    enum e_result udp;
+} t_port_result;
+
+    
 Nmap nmap;
 
 /*
@@ -106,16 +119,339 @@ Nmap nmap;
     *@return: int value of the char c 
 */
 
-static int hex_value(char c)
+const char *result_to_string(enum e_result result)
 {
-    if (c >= '0' && c <= '9')
-        return (c - '0');
-    if (c >= 'a' && c <= 'f')
-        return (c - 'a' + 10);
-    if (c >= 'A' && c <= 'F')
-        return (c - 'A' + 10);
-    return (-1);
+    if (result == RESULT_OPEN)
+        return "Open";
+
+    if (result == RESULT_CLOSED)
+        return "Closed";
+
+    if (result == RESULT_FILTERED)
+        return "Filtered";
+
+    if (result == RESULT_OPEN_FILTERED)
+        return "Open|Filtered";
+
+    if (result == RESULT_UNFILTERED)
+        return "Unfiltered";
+
+    return "N/A";
 }
+
+enum e_result reconstruct_tcp(int index, int scan)
+{
+    struct tcphdr *tcp;
+
+    if (nmap.time[index][scan] == 0)
+    {
+        if (scan == 0)
+            return RESULT_FILTERED;
+
+        if (scan == 1 || scan == 2 || scan == 3)
+            return RESULT_OPEN_FILTERED;
+
+        if (scan == 4)
+            return RESULT_FILTERED;
+    }
+
+    tcp = &nmap.tcp[index][scan];
+
+    if (scan == 0) // SYN
+    {
+        if (tcp->syn && tcp->ack)
+            return RESULT_OPEN;
+
+        if (tcp->rst)
+            return RESULT_CLOSED;
+    }
+
+    if (scan == 1) // FIN
+    {
+        if (tcp->rst)
+            return RESULT_CLOSED;
+    }
+
+    if (scan == 2) // NULL
+    {
+        if (tcp->rst)
+            return RESULT_CLOSED;
+    }
+
+    if (scan == 3) // XMAS
+    {
+        if (tcp->rst)
+            return RESULT_CLOSED;
+    }
+
+    if (scan == 4) // ACK
+    {
+        if (tcp->rst)
+            return RESULT_UNFILTERED;
+    }
+
+    return RESULT_NONE;
+}
+
+enum e_result reconstruct_udp(int index)
+{
+    if (nmap.time[index][5] >= 1000)
+        return RESULT_OPEN_FILTERED;
+
+    if (nmap.icmp[index].type == ICMP_DEST_UNREACH &&
+        nmap.icmp[index].code == ICMP_PORT_UNREACH)
+        return RESULT_CLOSED;
+
+    return RESULT_OPEN;
+}
+
+void reconstruct_port(int index, int port, t_port_result *result)
+{
+    result->port = port;
+
+    result->syn = RESULT_NONE;
+    result->nul = RESULT_NONE;
+    result->fin = RESULT_NONE;
+    result->xmas = RESULT_NONE;
+    result->ack = RESULT_NONE;
+    result->udp = RESULT_NONE;
+
+    if (nmap.opts.scan == NULL)
+    {
+        result->syn = reconstruct_tcp(index, 0);
+        result->nul = reconstruct_tcp(index, 2);
+        result->fin = reconstruct_tcp(index, 1);
+        result->xmas = reconstruct_tcp(index, 3);
+        result->ack = reconstruct_tcp(index, 4);
+        result->udp = reconstruct_udp(index);
+    }
+    else if (strcmp(nmap.opts.scan, "SYN") == 0)
+        result->syn = reconstruct_tcp(index, 0);
+
+    else if (strcmp(nmap.opts.scan, "FIN") == 0)
+        result->fin = reconstruct_tcp(index, 1);
+
+    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+        result->nul = reconstruct_tcp(index, 2);
+
+    else if (strcmp(nmap.opts.scan, "XMAS") == 0)
+        result->xmas = reconstruct_tcp(index, 3);
+
+    else if (strcmp(nmap.opts.scan, "ACK") == 0)
+        result->ack = reconstruct_tcp(index, 4);
+
+    else if (strcmp(nmap.opts.scan, "UDP") == 0)
+        result->udp = reconstruct_udp(index);
+}
+
+enum e_result get_port_conclusion(t_port_result *result)
+{
+    /*
+     * Un seul scan :
+     * la conclusion est directement le résultat du scan.
+     */
+    if (nmap.opts.scan != NULL)
+    {
+        if (strcmp(nmap.opts.scan, "SYN") == 0)
+            return result->syn;
+
+        if (strcmp(nmap.opts.scan, "FIN") == 0)
+            return result->fin;
+
+        if (strcmp(nmap.opts.scan, "NUL") == 0)
+            return result->nul;
+
+        if (strcmp(nmap.opts.scan, "XMAS") == 0)
+            return result->xmas;
+
+        if (strcmp(nmap.opts.scan, "ACK") == 0)
+            return result->ack;
+
+        if (strcmp(nmap.opts.scan, "UDP") == 0)
+            return result->udp;
+    }
+
+    /*
+     * Sans --scan :
+     * on utilise les résultats de tous les scans.
+     */
+
+    if (result->syn == RESULT_OPEN ||
+        result->udp == RESULT_OPEN)
+        return RESULT_OPEN;
+
+    if (result->syn == RESULT_CLOSED ||
+        result->nul == RESULT_CLOSED ||
+        result->fin == RESULT_CLOSED ||
+        result->xmas == RESULT_CLOSED ||
+        result->udp == RESULT_CLOSED)
+        return RESULT_CLOSED;
+
+    if (result->ack == RESULT_UNFILTERED)
+        return RESULT_UNFILTERED;
+
+    if (result->syn == RESULT_FILTERED ||
+        result->nul == RESULT_FILTERED ||
+        result->fin == RESULT_FILTERED ||
+        result->xmas == RESULT_FILTERED ||
+        result->ack == RESULT_FILTERED ||
+        result->udp == RESULT_FILTERED)
+        return RESULT_FILTERED;
+
+    if (result->nul == RESULT_OPEN_FILTERED ||
+        result->fin == RESULT_OPEN_FILTERED ||
+        result->xmas == RESULT_OPEN_FILTERED ||
+        result->udp == RESULT_OPEN_FILTERED)
+        return RESULT_OPEN_FILTERED;
+
+    return RESULT_NONE;
+}
+
+int is_port_open(t_port_result *result)
+{
+    if (get_port_conclusion(result) == RESULT_OPEN)
+        return 1;
+
+    return 0;
+}
+
+const char *get_service_name(int port)
+{
+    struct servent *service;
+
+    service = getservbyport(htons(port), "tcp");
+
+    if (service != NULL)
+        return service->s_name;
+
+    service = getservbyport(htons(port), "udp");
+
+    if (service != NULL)
+        return service->s_name;
+
+    return "Unassigned";
+}
+
+void print_port_result(t_port_result *result)
+{
+    printf("%-6d %-15s ",
+        result->port,
+        get_service_name(result->port));
+
+    if (nmap.opts.scan == NULL)
+    {
+        printf("SYN(%s) ",
+            result_to_string(result->syn));
+
+        printf("NULL(%s) ",
+            result_to_string(result->nul));
+
+        printf("FIN(%s) ",
+            result_to_string(result->fin));
+
+        printf("XMAS(%s) ",
+            result_to_string(result->xmas));
+
+        printf("ACK(%s) ",
+            result_to_string(result->ack));
+
+        printf("UDP(%s) ",
+            result_to_string(result->udp));
+    }
+    else if (strcmp(nmap.opts.scan, "SYN") == 0)
+    {
+        printf("SYN(%s) ",
+            result_to_string(result->syn));
+    }
+    else if (strcmp(nmap.opts.scan, "FIN") == 0)
+    {
+        printf("FIN(%s) ",
+            result_to_string(result->fin));
+    }
+    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+    {
+        printf("NULL(%s) ",
+            result_to_string(result->nul));
+    }
+    else if (strcmp(nmap.opts.scan, "XMAS") == 0)
+    {
+        printf("XMAS(%s) ",
+            result_to_string(result->xmas));
+    }
+    else if (strcmp(nmap.opts.scan, "ACK") == 0)
+    {
+        printf("ACK(%s) ",
+            result_to_string(result->ack));
+    }
+    else if (strcmp(nmap.opts.scan, "UDP") == 0)
+    {
+        printf("UDP(%s) ",
+            result_to_string(result->udp));
+    }
+
+    printf("%s\n",
+        result_to_string(get_port_conclusion(result)));
+}
+
+void display_config(void)
+{
+    printf("Scan Configurations\n");
+    printf("Target Ip-Address : %s\n", nmap.opts.ip);
+
+    if (nmap.onePort == 0)
+        printf("No of Ports to scan : %d\n", nmap.opts.port);
+    else
+        printf("No of Ports to scan : 1\n");
+
+    printf("Scans to be performed : ");
+
+    if (nmap.opts.scan == NULL)
+        printf("SYN NULL FIN XMAS ACK UDP\n");
+    else
+        printf("%s\n", nmap.opts.scan);
+
+    printf("No of threads : %d\n", nmap.opts.speedUp);
+    printf("Scanning..\n");
+}
+
+void display_results(void)
+{
+    int start = atoi(nmap.nb1);
+    int count;
+    t_port_result result;
+
+    if (nmap.onePort == 0)
+        count = nmap.opts.port;
+    else
+        count = 1;
+
+    printf("\nIP address: %s\n", nmap.opts.ip);
+
+    printf("\nOpen ports:\n");
+    printf("Port Service Name (if applicable) Results Conclusion\n");
+    printf("----------------------------------------------------------------------------------------\n");
+
+    for (int i = 0; i < count; i++)
+    {
+        reconstruct_port(i, start + i, &result);
+
+        if (is_port_open(&result))
+            print_port_result(&result);
+    }
+
+    printf("\nClosed/Filtered/Unfiltered ports:\n");
+    printf("Port Service Name (if applicable) Results Conclusion\n");
+    printf("----------------------------------------------------------------------------------------\n");
+
+    for (int i = 0; i < count; i++)
+    {
+        reconstruct_port(i, start + i, &result);
+
+        if (!is_port_open(&result))
+            print_port_result(&result);
+    }
+}
+
 
 unsigned short checksum(void *b, int len)
 {
@@ -202,7 +538,7 @@ int getInterfaceReseau(struct interphase *reseau)
 
     if (getifaddrs(&ifaddr) == -1) {
         perror("getifaddrs");
-        return 1;
+        return -1;
     }
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
@@ -618,9 +954,12 @@ void scanudp(int port)
             break;
         }
     }
-    //nmap.time[port - atoi(nmap.nb1)][5] = elapsed_ms;
-   // memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
-    //memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
+    nmap.time[port - atoi(nmap.nb1)][5] = elapsed_ms;
+    printf("voici :: %d\n", port - atoi(nmap.nb1));
+    if (udp != NULL)
+        memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
+    if (icmp != NULL)
+        memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
     pcap_close(handle);
     close(sock);
 }
@@ -634,7 +973,10 @@ void scantcp(int port, int scan)
     memset(&pkt, 0, sizeof(pkt));
     struct bpf_program fp;
     struct tcphdr *tcp;
-    struct iphdr *ip;   
+    struct iphdr *ip;  
+    static int myport = 0;
+
+    myport++;
     
     
 // configure IP
@@ -652,7 +994,7 @@ void scantcp(int port, int scan)
     pkt.ip.check = checksum(&pkt.ip, sizeof(struct iphdr));
 
 // configure tcp 
-    pkt.tcp.source = htons(4242); // source port
+    pkt.tcp.source = htons(myport); // source port
    // nmap.pkt.tcp.dest = htons(atoi(nmap.opts.port)); // destination port
     pkt.tcp.dest = htons(port);
     pkt.tcp.seq = htonl(0);
@@ -677,6 +1019,11 @@ void scantcp(int port, int scan)
         pkt.tcp.ack = 1; // ACK flag
     else if (scan == 6)
         pkt.tcp.rst = 1; // RST flag
+
+   /* printf("Interface      = %s\n", nmap.reseau.name);
+    printf("Source IP      = %s\n", inet_ntoa(nmap.sip));
+    printf("Destination IP = %s\n", inet_ntoa(nmap.tip));
+    printf("Destination port = %d\n", port);*/
 
 
 // config pseudo header
@@ -749,7 +1096,7 @@ void scantcp(int port, int scan)
     struct pcap_pkthdr *header;
     const u_char *packet;
     int ret;
-    printf("Waiting for response...\n");
+   // printf("Waiting for response...\n");
     while (1)
     {
         ret = pcap_next_ex(handle, &header, &packet);
@@ -767,7 +1114,7 @@ void scantcp(int port, int scan)
             break;
         }
 
-        printf("Packet captured: %u bytes\n", header->caplen);
+     //   printf("Packet captured: %u bytes\n", header->caplen);
 
         if (header->caplen < sizeof(struct ethernet_header))
             continue;
@@ -785,9 +1132,9 @@ void scantcp(int port, int scan)
         ip =
             (struct iphdr *)(packet + sizeof(struct ethernet_header));
 
-        printf("IP version = %u\n", ip->version);
+       /* printf("IP version = %u\n", ip->version);
         printf("IP header length = %u bytes\n", ip->ihl * 4);
-        printf("IP protocol = %u\n", ip->protocol);
+        printf("IP protocol = %u\n", ip->protocol);*/
 
         if (ip->protocol != IPPROTO_TCP)
             continue;
@@ -801,7 +1148,7 @@ void scantcp(int port, int scan)
         tcp =
             (struct tcphdr *)((unsigned char *)ip + ip->ihl * 4);
 
-        struct in_addr packet_src;
+        /*struct in_addr packet_src;
         struct in_addr packet_dst;
 
         packet_src.s_addr = ip->saddr;
@@ -815,17 +1162,17 @@ void scantcp(int port, int scan)
 
         printf("SYN = %u\n", tcp->syn);
         printf("ACK = %u\n", tcp->ack);
-        printf("RST = %u\n", tcp->rst);
+        printf("RST = %u\n", tcp->rst);*/
         
 
         break;
     }
     int index = port - atoi(nmap.nb1);
-    printf("after while\n");
-    //nmap.time[index][scan - 1] = ret;
-    printf("Time recorded: %ld\n", nmap.time[index][scan - 1]);
-   // memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
-    //memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
+   // printf("after while\n");
+    nmap.time[index][scan - 1] = ret;
+    //printf("Time recorded: %ld\n", nmap.time[index][scan - 1]);
+    memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
+    memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
     pcap_close(handle);
     close(sock);
 }
@@ -835,7 +1182,7 @@ void * workers(void *arg)
     int *port = (int*) arg;
     if (nmap.opts.scan == NULL)
     {
-        printf("all scn\n");
+        printf("all scn port = %d\n", *port + atoi(nmap.nb1));
         scantcp(*port + atoi(nmap.nb1), 1);
         scantcp(*port + atoi(nmap.nb1), 2);
         scantcp(*port + atoi(nmap.nb1), 3);
@@ -873,29 +1220,44 @@ void * workers(void *arg)
 void scanManager()
 {
     pthread_t threads[250];
-
+    int *port = malloc(sizeof(int) * nmap.opts.port);
   //  nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
     //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
-   // Nmap nm[250];
-    nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
-    nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
+
     int j = 0;
     if (nmap.onePort == 0)
     {
         for (int i = 0; i < nmap.opts.port; i++)
         {
-                nmap.tcp[i - atoi(nmap.nb1)] = malloc(sizeof(struct tcphdr) * 6);
-                nmap.ip[i - atoi(nmap.nb1)] = malloc(sizeof(struct iphdr) * 6 );
-                nmap.time[i - atoi(nmap.nb1)] = malloc(sizeof(long) * 6);
-            if (j == 250)
-            {
-                j = 0;
-                for (int k = 0; k < nmap.opts.speedUp; k++)
+                nmap.tcp[i] = malloc(sizeof(struct tcphdr) * 6);
+                nmap.ip[i] = malloc(sizeof(struct iphdr) * 6 );
+                nmap.time[i] = malloc(sizeof(long) * 6);
+                port[i] = i;
+                pthread_create(&threads[j], NULL, workers, &port[i]);
+                j++;
+                if (j == nmap.opts.speedUp || j == nmap.opts.port)
                 {
-                    pthread_join(threads[k], NULL);
+                    
+                    for (int k = 0; k < j; k++)
+                    {
+                        pthread_join(threads[k], NULL);
+                    }
+                    j = 0;
                 }
+            
+            if (i == nmap.opts.port - 1)
+            {
+                display_results();
+                for (int index = 0; index < nmap.opts.port; index++)
+                {
+                    free(nmap.tcp[index]);
+                    free(nmap.ip[index]);
+                    free(nmap.time[index]);
+                }
+                
             }
         }
+        
     }
     else 
     {
@@ -905,6 +1267,10 @@ void scanManager()
         printf("one = %d", nmap.onePort - atoi(nmap.nb1));
         int p = 0;
         workers(&p);
+        display_results();
+        free(nmap.tcp[0]);
+        free(nmap.ip[0]);
+        free(nmap.time[0]);
     }
 }
 
@@ -919,6 +1285,33 @@ void print_help(void)
     printf("--scan SYN/NULL/FIN/XMAS/ACK/UDP\n");
 }
 
+char *get_next_line(int fd)
+{
+    static char line[16];
+    char c;
+    int i = 0;
+
+    while (i < 15 && read(fd, &c, 1) == 1 && c != '\n')
+        line[i++] = c;
+    line[i] = 0;
+    if (c != 0 || c != EOF)
+    {
+        printf("bad ip in file error");
+        exit(-3);
+    }
+    return i ? line : NULL;
+}
+
+
+void ip_in_file()
+{
+
+    if(!inet_pton(AF_INET, nmap.opts.ip, &nmap.tip))
+    {
+        fprintf(stderr, "Invalid IP address: %s\n", nmap.opts.ip);
+        exit (-3);
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -927,9 +1320,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "Erreur: ce programme doit être exécuté en root.\n");
         return 1;
     }
-    nmap.opts.speedUp = 0;
+    nmap.opts.speedUp = 250;
     nmap.onePort = -1;
     nmap.opts.scan = NULL;
+    nmap.reseau.name = NULL;
+    nmap.opts.file = 0;
     if (argc < 2) {
         print_help();
         return 0;
@@ -975,6 +1370,8 @@ int main(int argc, char **argv)
                     nmap.ip = malloc(sizeof(struct iphdr*) * 1);
                     nmap.tcp = malloc(sizeof(struct tcphdr*) * 1);
                     nmap.time = malloc(sizeof(long*) * 1);
+                    nmap.udp = malloc(sizeof(struct udphdr) * 1);
+                    nmap.icmp = malloc(sizeof(struct icmphdr) * 1);
                     break;
                 }
                 index++; 
@@ -1005,6 +1402,8 @@ int main(int argc, char **argv)
                 nmap.ip = malloc(sizeof(struct iphdr*) * nmap.opts.port);
                 nmap.tcp = malloc(sizeof(struct tcphdr*) * nmap.opts.port);
                 nmap.time = malloc(sizeof(long*) * nmap.opts.port);
+                nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
+                nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
                 i++;
             }
             else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc)
@@ -1046,15 +1445,22 @@ int main(int argc, char **argv)
             }
         }
     }
+    printf("ok1\n");
 
     getInterfaceReseau(&nmap.reseau);
+    if (nmap.reseau.name == NULL){
+        printf("probleme avec l'interphase reseau \n");
+        return -2;
+    }
     inet_pton(AF_INET, nmap.reseau.ip, &nmap.sip); // source ip
     if (nmap.onePort == -1)
         nmap.onePort = 42;
     scanManager();
-    hex_value('F');
-    free(nmap.ip);
+   /* free(nmap.ip);
     free(nmap.tcp);
     free(nmap.udp);
-    free(nmap.icmp);
+    free(nmap.icmp);*/
+    free(nmap.reseau.name);
+    free(nmap.reseau.ip);
+    free(nmap.reseau.mac);
 }
