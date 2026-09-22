@@ -14,3 +14,49 @@
 | **UDP**  | UDP             | **ICMP Port Unreachable** | `CLOSED`                  |
 |          |                 | réponse UDP               | `OPEN`                    |
 |          |                 | aucune réponse            | `OPEN\|FILTERED`          |
+list des fonctions 
+jfarchic 
+result_to_string()
+
+reconstruct_tcp()
+
+reconstruct_udp()
+
+reconstruct_port()
+
+print_port_result()
+
+display_config()
+
+display_results()
+
+get_port_conclusion()
+
+is_port_open()
+
+ksongbe
+get_service_name()
+
+checksum()
+
+find_ip()
+
+find_hostname()
+
+find_dns()
+
+getInterfaceReseau()
+
+scanudp()
+
+scantcp()
+
+workers()
+
+scanManager()
+
+print_help()
+
+ip_in_file()
+
+main()

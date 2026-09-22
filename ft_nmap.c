@@ -20,6 +20,7 @@
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
 #include <sys/time.h>
+#include <fcntl.h>
 
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025 // Maximum length of a hostname 
@@ -59,6 +60,8 @@ typedef struct s_opts
     int file; // File name containing IP addresses to scan,
     int speedUp;
     int port;
+    char *strP;
+    char * hostname;
 }   t_opts;
 
 struct packet {
@@ -85,7 +88,8 @@ typedef struct nmap {
     struct udphdr *udp;
     struct icmphdr *icmp;
     long **time;
-
+    char *dns;
+    int os;
 } Nmap;
 
 enum e_result
@@ -500,6 +504,40 @@ char *find_ip(char *hostname)
     freeaddrinfo(res);
     return ipstr;
 }
+char *find_hostname(char *ip)
+{
+    static char hostname[NI_MAXHOST];
+    struct sockaddr_in sa;
+    int ret;
+
+    memset(&sa, 0, sizeof(sa));
+
+    sa.sin_family = AF_INET;
+
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1)
+    {
+        fprintf(stderr, "Invalid IP address: %s\n", ip);
+        return NULL;
+    }
+
+    ret = getnameinfo(
+        (struct sockaddr *)&sa,
+        sizeof(sa),
+        hostname,
+        sizeof(hostname),
+        NULL,
+        0,
+        NI_NAMEREQD
+    );
+
+    if (ret != 0)
+    {
+        fprintf(stderr, "getnameinfo: %s\n", gai_strerror(ret));
+        return NULL;
+    }
+
+    return hostname;
+}
 
 char *find_dns(char *ip)
 {
@@ -757,7 +795,7 @@ void scanudp(int port)
         return;
     }
 
-    printf("Waiting for response...\n");
+    //printf("Waiting for response...\n");
 
 
     struct timeval start;
@@ -775,7 +813,7 @@ void scanudp(int port)
 
         if (elapsed_ms >= 1000)
         {
-            printf("UDP port %d is OPEN|FILTERED\n", port);
+            //printf("UDP port %d is OPEN|FILTERED\n", port);
             break;
         }
 
@@ -858,7 +896,7 @@ void scanudp(int port)
             if (ntohs(udp->dest) != 4242)
                 continue;
 
-            printf("UDP port %d is OPEN\n", port);
+          //  printf("UDP port %d is OPEN\n", port);
 
             break;
         }
@@ -878,21 +916,13 @@ void scanudp(int port)
             icmp = (struct icmphdr *)
                 ((unsigned char *)ip + ip_len);
 
-            /*
-             * On ne s'intéresse ici qu'au
-             * ICMP Destination Unreachable.
-             */
+
             if (icmp->type != ICMP_DEST_UNREACH)
                 continue;
 
             if (icmp->code != ICMP_PORT_UNREACH)
                 continue;
 
-            /*
-             * Un paquet ICMP error contient
-             * l'ancien paquet IP + les premiers
-             * octets du paquet UDP.
-             */
 
             unsigned char *inner =
                 (unsigned char *)icmp +
@@ -949,19 +979,19 @@ void scanudp(int port)
             if (ntohs(inner_udp->dest) != port)
                 continue;
 
-            printf("UDP port %d is CLOSED\n", port);
+           // printf("UDP port %d is CLOSED\n", port);
 
             break;
         }
     }
     nmap.time[port - atoi(nmap.nb1)][5] = elapsed_ms;
-    printf("voici :: %d\n", port - atoi(nmap.nb1));
     if (udp != NULL)
         memcpy(&nmap.udp[port - atoi(nmap.nb1)], udp, sizeof(struct udphdr));
     if (icmp != NULL)
         memcpy(&nmap.icmp[port - atoi(nmap.nb1)], icmp, sizeof(struct icmphdr));
     pcap_close(handle);
     close(sock);
+    pcap_freecode(&fp);
 }
 
 void scantcp(int port, int scan) 
@@ -972,8 +1002,8 @@ void scantcp(int port, int scan)
     struct pseudo_header psh;
     memset(&pkt, 0, sizeof(pkt));
     struct bpf_program fp;
-    struct tcphdr *tcp;
-    struct iphdr *ip;  
+    struct tcphdr *tcp = NULL;
+    struct iphdr *ip = NULL;  
     static int myport = 0;
 
     myport++;
@@ -1069,15 +1099,24 @@ void scantcp(int port, int scan)
         "tcp and src host %s and src port %d",
         inet_ntoa(nmap.tip),
     ntohs(pkt.tcp.dest));
-    pcap_compile(
-        handle,
-        &fp,
-        filter_exp,
-        0,
-        PCAP_NETMASK_UNKNOWN // mask no correctly connection
-    );
+    if (pcap_compile(handle, &fp, filter_exp, 0,
+                 PCAP_NETMASK_UNKNOWN) == -1)
+    {
+        fprintf(stderr, "pcap_compile: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
 
-    pcap_setfilter(handle, &fp);
+    if (pcap_setfilter(handle, &fp) == -1)
+    {
+        fprintf(stderr, "pcap_setfilter: %s\n", pcap_geterr(handle));
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
+
 
     struct sockaddr_in dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
@@ -1090,7 +1129,7 @@ void scantcp(int port, int scan)
     if (sent < 0) {
         printf("Error sending packet: %s\n", strerror(errno));
         perror("sendto");
-        exit(EXIT_FAILURE);
+        return ;
     }
 
     struct pcap_pkthdr *header;
@@ -1105,12 +1144,12 @@ void scantcp(int port, int scan)
         {
             fprintf(stderr, "pcap_next_ex: %s\n",
                     pcap_geterr(handle));
-            exit(EXIT_FAILURE);
+            return;
         }
 
         if (ret == 0)
         {
-            printf("Timeout\n");
+           // printf("Timeout\n");
             break;
         }
 
@@ -1171,8 +1210,39 @@ void scantcp(int port, int scan)
    // printf("after while\n");
     nmap.time[index][scan - 1] = ret;
     //printf("Time recorded: %ld\n", nmap.time[index][scan - 1]);
-    memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
-    memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
+    if (tcp != NULL)
+        memcpy(&nmap.tcp[index][scan - 1], tcp, sizeof(struct tcphdr));
+    if (ip != NULL)
+        memcpy(&nmap.ip[index][scan - 1], ip, sizeof(struct iphdr));
+    if (nmap.os == 1)
+    {
+        if (ip != NULL && tcp != NULL)
+        {
+            int ttl = ip->ttl;
+            int window = ntohs(tcp->window);
+            int df = ntohs(ip->frag_off) & IP_DF;
+
+            printf("OS fingerprint:\n");
+            printf("  TTL    : %d\n", ttl);
+            printf("  Window : %d\n", window);
+            printf("  DF     : %s\n", df ? "yes" : "no");
+
+            if (ttl > 96 && ttl <= 128)
+                printf("  OS guess: Windows-like\n");
+            else if (ttl > 32 && ttl <= 64)
+                printf("  OS guess: Linux/Unix-like\n");
+            else
+                printf("  OS guess: Unknown\n");
+        }
+        else
+        {
+            printf("OS fingerprint: no TCP response received\n");
+        }
+
+    nmap.os = 0;
+    }
+    
+    pcap_freecode(&fp);
     pcap_close(handle);
     close(sock);
 }
@@ -1182,7 +1252,6 @@ void * workers(void *arg)
     int *port = (int*) arg;
     if (nmap.opts.scan == NULL)
     {
-        printf("all scn port = %d\n", *port + atoi(nmap.nb1));
         scantcp(*port + atoi(nmap.nb1), 1);
         scantcp(*port + atoi(nmap.nb1), 2);
         scantcp(*port + atoi(nmap.nb1), 3);
@@ -1220,22 +1289,37 @@ void * workers(void *arg)
 void scanManager()
 {
     pthread_t threads[250];
-    int *port = malloc(sizeof(int) * nmap.opts.port);
+    int *port = malloc(sizeof(int) * (nmap.opts.port+1));
   //  nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
     //nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
+    char *hostname = find_hostname(nmap.opts.ip);
 
+    if (hostname != NULL)
+        printf("RhDNS : %s\n", hostname);
+    if (nmap.opts.ip != NULL)
+    {
+        nmap.dns = find_dns(nmap.opts.ip);
+        printf("dns: %s\n", nmap.dns);
+        free(nmap.dns);
+    }
     int j = 0;
+    display_config();
+    nmap.os = 1;
     if (nmap.onePort == 0)
     {
-        for (int i = 0; i < nmap.opts.port; i++)
+        for (int i = 0; i < nmap.opts.port + 1; i++)
         {
                 nmap.tcp[i] = malloc(sizeof(struct tcphdr) * 6);
                 nmap.ip[i] = malloc(sizeof(struct iphdr) * 6 );
                 nmap.time[i] = malloc(sizeof(long) * 6);
+                memset(nmap.tcp[i], 0, sizeof(struct tcphdr) * 6);
+                memset(nmap.ip[i], 0, sizeof(struct iphdr) * 6);
+                memset(nmap.time[i], 0, sizeof(long) * 6);
+
                 port[i] = i;
                 pthread_create(&threads[j], NULL, workers, &port[i]);
                 j++;
-                if (j == nmap.opts.speedUp || j == nmap.opts.port)
+                if (j == nmap.opts.speedUp || j == nmap.opts.port + 1)
                 {
                     
                     for (int k = 0; k < j; k++)
@@ -1245,10 +1329,10 @@ void scanManager()
                     j = 0;
                 }
             
-            if (i == nmap.opts.port - 1)
+            if (i == nmap.opts.port)
             {
                 display_results();
-                for (int index = 0; index < nmap.opts.port; index++)
+                for (int index = 0; index < nmap.opts.port + 1; index++)
                 {
                     free(nmap.tcp[index]);
                     free(nmap.ip[index]);
@@ -1264,7 +1348,7 @@ void scanManager()
         nmap.tcp[0] = malloc(sizeof(struct tcphdr) * 6);
         nmap.ip[0] = malloc(sizeof(struct iphdr) * 6 );
         nmap.time[0] = malloc(sizeof(long) * 6);
-        printf("one = %d", nmap.onePort - atoi(nmap.nb1));
+      //  printf("one = %d", nmap.onePort - atoi(nmap.nb1));
         int p = 0;
         workers(&p);
         display_results();
@@ -1272,45 +1356,76 @@ void scanManager()
         free(nmap.ip[0]);
         free(nmap.time[0]);
     }
+    free(port);
 }
 
 void print_help(void)
 {
     printf("ft_nmap [OPTIONS]\n");
     printf("--help Print this help screen\n");
-    printf("--ports ports to scan (eg: 1-10 or 1,2,3 or 1,5-15)\n");
+    printf("--ports ports to scan (eg: 1-10, or 1 or 42)\n");
     printf("--ip ip address to scan\n");
     printf("--file File name containing IP addresses to scan\n");
     printf("--speedup [250 max] number of parallel threads\n");
     printf("--scan SYN/NULL/FIN/XMAS/ACK/UDP\n");
 }
 
-char *get_next_line(int fd)
+void ip_in_file()
 {
     static char line[16];
     char c;
-    int i = 0;
+    int i;
+    int r;
 
-    while (i < 15 && read(fd, &c, 1) == 1 && c != '\n')
-        line[i++] = c;
-    line[i] = 0;
-    if (c != 0 || c != EOF)
+    nmap.opts.ip = line;
+
+    while (1)
     {
-        printf("bad ip in file error");
-        exit(-3);
+        i = 0;
+
+        while (i < 15)
+        {
+            r = read(nmap.opts.file, &c, 1);
+
+            if (r == 0)
+                break;
+
+            if (r == -1)
+            {
+                perror("read");
+                return;
+            }
+
+            if (c == '\n')
+                break;
+
+            line[i] = c;
+            i++;
+        }
+
+        line[i] = 0;
+
+        if (i == 0)
+        {
+            if (r == 0)
+                break;
+            continue;
+        }
+
+        if (!inet_pton(AF_INET, line, &nmap.tip))
+        {
+            fprintf(stderr,
+                "Invalide IP address: %s\n",
+                line);
+            return;
+        }
+
+        scanManager();
+
+        if (r == 0)
+            break;
     }
-    return i ? line : NULL;
-}
-
-
-void ip_in_file()
-{
-
-    if(!inet_pton(AF_INET, nmap.opts.ip, &nmap.tip))
-    {
-        fprintf(stderr, "Invalid IP address: %s\n", nmap.opts.ip);
-        exit (-3);
-    }
+    close (nmap.opts.file);
 }
 
 int main(int argc, char **argv)
@@ -1325,6 +1440,10 @@ int main(int argc, char **argv)
     nmap.opts.scan = NULL;
     nmap.reseau.name = NULL;
     nmap.opts.file = 0;
+    nmap.opts.strP = NULL;
+    nmap.opts.ip = NULL;
+    nmap.opts.hostname = NULL;
+    nmap.os = 1;
     if (argc < 2) {
         print_help();
         return 0;
@@ -1350,6 +1469,7 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "--ports") == 0 && i + 1 < argc)
             {
+                nmap.opts.strP = argv[i];
                 nmap.onePort = 0;
                 int index = 0;
                 if (argv[i+1][index] == '-')
@@ -1372,7 +1492,13 @@ int main(int argc, char **argv)
                     nmap.time = malloc(sizeof(long*) * 1);
                     nmap.udp = malloc(sizeof(struct udphdr) * 1);
                     nmap.icmp = malloc(sizeof(struct icmphdr) * 1);
-                    break;
+                    memset(nmap.ip, 0, sizeof(struct iphdr*) * 1);
+                    memset(nmap.tcp, 0, sizeof(struct tcphdr*) * 1);
+                    memset(nmap.time, 0, sizeof(long*) * 1);
+                    memset(nmap.udp, 0, sizeof(struct udphdr) * 1);
+                    memset(nmap.icmp, 0, sizeof(struct icmphdr) * 1);
+
+                    continue;
                 }
                 index++; 
                 int i1 = 0;
@@ -1399,25 +1525,28 @@ int main(int argc, char **argv)
                     return -1;
                 }
 
-                nmap.ip = malloc(sizeof(struct iphdr*) * nmap.opts.port);
-                nmap.tcp = malloc(sizeof(struct tcphdr*) * nmap.opts.port);
-                nmap.time = malloc(sizeof(long*) * nmap.opts.port);
-                nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
-                nmap.icmp = malloc(sizeof(struct icmphdr) * nmap.opts.port);
+                nmap.ip = malloc(sizeof(struct iphdr*) * (nmap.opts.port+1));
+                nmap.tcp = malloc(sizeof(struct tcphdr*) * (nmap.opts.port+1));
+                nmap.time = malloc(sizeof(long*) * (nmap.opts.port+1));
+                nmap.udp = malloc(sizeof(struct udphdr) * (nmap.opts.port+1));
+                nmap.icmp = malloc(sizeof(struct icmphdr) * (nmap.opts.port+1));
+                memset(nmap.ip, 0, sizeof(struct iphdr*) * (nmap.opts.port+1));
+                memset(nmap.tcp, 0, sizeof(struct tcphdr*) * (nmap.opts.port+1));
+                memset(nmap.time, 0, sizeof(long*) * (nmap.opts.port+1));
+                memset(nmap.udp, 0, sizeof(struct udphdr) * (nmap.opts.port+1));
+                memset(nmap.icmp, 0, sizeof(struct icmphdr) * (nmap.opts.port+1));
+
                 i++;
             }
             else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc)
             {
-                nmap.opts.file = 1;
-                nmap.opts.ip = argv[i + 1];
+                nmap.opts.file = open(argv[i+1], O_RDONLY);
                 i++;
             }
             else if (strcmp(argv[i], "--speedup") == 0 && i + 1 < argc)
             {
                 nmap.opts.speedUp = atoi(argv[i + 1]);
-                if (nmap.opts.speedUp > 250)
-                    nmap.opts.speedUp = 250;
-                if (nmap.opts.speedUp < 0)
+                if (nmap.opts.speedUp <= 0 || nmap.opts.speedUp > 250)
                 {
                     printf("speedup: bad arg\n");
                     return -1;
@@ -1439,27 +1568,44 @@ int main(int argc, char **argv)
                 
                 i++;
             }
+            else if (strcmp(argv[i], "--hostname") == 0 && i + 1 < argc)
+            {
+                nmap.opts.ip = find_ip(argv[i + 1]);
+                if(!inet_pton(AF_INET, nmap.opts.ip, &nmap.tip))
+                {
+                    fprintf(stderr, "Invalid IP address: %s\n", nmap.opts.ip);
+                    return 1;
+                }
+                printf("hostname : %s\n", argv[i+1]);
+            }
             else if (strcmp(argv[1], "--help") == 0) {
                 print_help();
                 return 0;
             }
         }
     }
-    printf("ok1\n");
-
+    if (nmap.onePort == - 1 || nmap.opts.strP == NULL)
+        return -3;
+    if (nmap.opts.ip == NULL && nmap.opts.file == 0 && nmap.opts.hostname)
+        return -4;
     getInterfaceReseau(&nmap.reseau);
     if (nmap.reseau.name == NULL){
         printf("probleme avec l'interphase reseau \n");
         return -2;
     }
+
     inet_pton(AF_INET, nmap.reseau.ip, &nmap.sip); // source ip
     if (nmap.onePort == -1)
         nmap.onePort = 42;
-    scanManager();
-   /* free(nmap.ip);
+    if (nmap.opts.file)
+        ip_in_file();
+    else
+        scanManager();
+    free(nmap.ip);
     free(nmap.tcp);
+    free(nmap.time);
     free(nmap.udp);
-    free(nmap.icmp);*/
+    free(nmap.icmp);
     free(nmap.reseau.name);
     free(nmap.reseau.ip);
     free(nmap.reseau.mac);
