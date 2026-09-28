@@ -88,8 +88,10 @@ typedef struct nmap {
     struct udphdr *udp;
     struct icmphdr *icmp;
     long **time;
+    long timeout;
     char *dns;
     int os;
+    char *it;
 } Nmap;
 
 enum e_result
@@ -199,7 +201,7 @@ enum e_result reconstruct_tcp(int index, int scan)
 
 enum e_result reconstruct_udp(int index)
 {
-    if (nmap.time[index][5] >= 1000)
+    if (nmap.time[index][5] >= nmap.timeout)
         return RESULT_OPEN_FILTERED;
 
     if (nmap.icmp[index].type == ICMP_DEST_UNREACH &&
@@ -235,7 +237,7 @@ void reconstruct_port(int index, int port, t_port_result *result)
     else if (strcmp(nmap.opts.scan, "FIN") == 0)
         result->fin = reconstruct_tcp(index, 1);
 
-    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+    else if (strcmp(nmap.opts.scan, "NULL") == 0)
         result->nul = reconstruct_tcp(index, 2);
 
     else if (strcmp(nmap.opts.scan, "XMAS") == 0)
@@ -262,7 +264,7 @@ enum e_result get_port_conclusion(t_port_result *result)
         if (strcmp(nmap.opts.scan, "FIN") == 0)
             return result->fin;
 
-        if (strcmp(nmap.opts.scan, "NUL") == 0)
+        if (strcmp(nmap.opts.scan, "NULL") == 0)
             return result->nul;
 
         if (strcmp(nmap.opts.scan, "XMAS") == 0)
@@ -372,7 +374,7 @@ void print_port_result(t_port_result *result)
         printf("FIN(%s) ",
             result_to_string(result->fin));
     }
-    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+    else if (strcmp(nmap.opts.scan, "NULL") == 0)
     {
         printf("NULL(%s) ",
             result_to_string(result->nul));
@@ -403,7 +405,7 @@ void display_config(void)
     printf("Target Ip-Address : %s\n", nmap.opts.ip);
 
     if (nmap.onePort == 0)
-        printf("No of Ports to scan : %d\n", nmap.opts.port);
+        printf("No of Ports to scan : %d\n", nmap.opts.port + 1);
     else
         printf("No of Ports to scan : 1\n");
 
@@ -425,7 +427,7 @@ void display_results(void)
     t_port_result result;
 
     if (nmap.onePort == 0)
-        count = nmap.opts.port;
+        count = nmap.opts.port + 1;
     else
         count = 1;
 
@@ -504,6 +506,7 @@ char *find_ip(char *hostname)
     freeaddrinfo(res);
     return ipstr;
 }
+
 char *find_hostname(char *ip)
 {
     static char hostname[NI_MAXHOST];
@@ -599,7 +602,7 @@ int getInterfaceReseau(struct interphase *reseau)
         {
             struct sockaddr_ll *s =
                 (struct sockaddr_ll *)ifa->ifa_addr;
-            if(strcmp(ifa->ifa_name, "eth0") == 0) {
+            if(strcmp(ifa->ifa_name, nmap.it) == 0) {
                 char mac[18];
                 snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
                          s->sll_addr[0], s->sll_addr[1], s->sll_addr[2],
@@ -642,7 +645,7 @@ void scanudp(int port)
 
     memset(&pkt, 0, sizeof(pkt));
 
-
+    // configuration packet
     pkt.ip.version = 4;
     pkt.ip.ihl = 5;
     pkt.ip.tos = 0;
@@ -700,7 +703,7 @@ void scanudp(int port)
         nmap.reseau.name,
         65535,
         1,
-        100,
+        nmap.timeout,
         errbuf
     );
 
@@ -811,7 +814,7 @@ void scanudp(int port)
             (now.tv_sec - start.tv_sec) * 1000L +
             (now.tv_usec - start.tv_usec) / 1000L;
 
-        if (elapsed_ms >= 1000)
+        if (elapsed_ms >= nmap.timeout)
         {
             //printf("UDP port %d is OPEN|FILTERED\n", port);
             break;
@@ -836,7 +839,7 @@ void scanudp(int port)
 
         if (ret == 0)
         {
-            usleep(10000);
+            usleep(nmap.timeout);
             continue;
         }
 
@@ -992,6 +995,7 @@ void scanudp(int port)
     pcap_close(handle);
     close(sock);
     pcap_freecode(&fp);
+    return;
 }
 
 void scantcp(int port, int scan) 
@@ -1084,7 +1088,7 @@ void scantcp(int port, int scan)
         nmap.reseau.name,
         65535, // snaplen
         1,  // promisc
-        1000, // timeout in ms
+        nmap.timeout, // timeout in ms
         errbuf
     );
 
@@ -1116,13 +1120,22 @@ void scantcp(int port, int scan)
         close(sock);
         return;
     }
+    pcap_freecode(&fp);
 
+    if (pcap_setnonblock(handle, 1, errbuf) == -1)
+    {
+        fprintf(stderr,
+            "pcap_setnonblock: %s\n",
+            errbuf);
+        pcap_close(handle);
+        close(sock);
+        return;
+    }
 
     struct sockaddr_in dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_addr = nmap.tip;
-
     ssize_t sent =  sendto(sock, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     
@@ -1242,9 +1255,9 @@ void scantcp(int port, int scan)
     nmap.os = 0;
     }
     
-    pcap_freecode(&fp);
     pcap_close(handle);
     close(sock);
+    return;
 }
 
 void * workers(void *arg)
@@ -1267,7 +1280,7 @@ void * workers(void *arg)
     {
         scantcp(*port + atoi(nmap.nb1), 2);
     }
-    else if (strcmp(nmap.opts.scan, "NUL") == 0)
+    else if (strcmp(nmap.opts.scan, "NULL") == 0)
     {
         scantcp(*port + atoi(nmap.nb1), 3);
     }
@@ -1288,6 +1301,11 @@ void * workers(void *arg)
 
 void scanManager()
 {
+    struct timeval start;
+    struct timeval now;
+    long t;
+    
+
     pthread_t threads[250];
     int *port = malloc(sizeof(int) * (nmap.opts.port+1));
   //  nmap.udp = malloc(sizeof(struct udphdr) * nmap.opts.port);
@@ -1305,6 +1323,7 @@ void scanManager()
     int j = 0;
     display_config();
     nmap.os = 1;
+    gettimeofday(&start, NULL);
     if (nmap.onePort == 0)
     {
         for (int i = 0; i < nmap.opts.port + 1; i++)
@@ -1331,6 +1350,7 @@ void scanManager()
             
             if (i == nmap.opts.port)
             {
+                gettimeofday(&now, NULL);
                 display_results();
                 for (int index = 0; index < nmap.opts.port + 1; index++)
                 {
@@ -1341,7 +1361,6 @@ void scanManager()
                 
             }
         }
-        
     }
     else 
     {
@@ -1351,12 +1370,18 @@ void scanManager()
       //  printf("one = %d", nmap.onePort - atoi(nmap.nb1));
         int p = 0;
         workers(&p);
+        gettimeofday(&now, NULL);
         display_results();
         free(nmap.tcp[0]);
         free(nmap.ip[0]);
         free(nmap.time[0]);
     }
     free(port);
+    t =
+            (now.tv_sec - start.tv_sec) * 1000L +
+            (now.tv_usec - start.tv_usec) / 1000L;
+
+    printf("time = %ld ms", t);
 }
 
 void print_help(void)
@@ -1444,10 +1469,13 @@ int main(int argc, char **argv)
     nmap.opts.ip = NULL;
     nmap.opts.hostname = NULL;
     nmap.os = 1;
+    nmap.timeout = 100;
+    nmap.it = "eth0";
     if (argc < 2) {
         print_help();
         return 0;
     }
+
     if (argc > 1 && strcmp(argv[1], "--help") == 0) {
         print_help();
         return 0;
@@ -1459,7 +1487,9 @@ int main(int argc, char **argv)
         {
             if (strcmp(argv[i], "--ip") == 0 && i + 1 < argc)
             {
-                nmap.opts.ip = argv[i + 1];
+                nmap.opts.ip = find_ip(argv[i + 1]);
+                if (nmap.opts.ip == NULL)
+                    return -3;
                 if(!inet_pton(AF_INET, nmap.opts.ip, &nmap.tip))
                 {
                     fprintf(stderr, "Invalid IP address: %s\n", nmap.opts.ip);
@@ -1555,7 +1585,7 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "--scan") == 0 && i + 1 < argc)
             {
-                if (strcmp(argv[i + 1], "SYN") == 0 || strcmp(argv[i + 1], "NUL") == 0 || 
+                if (strcmp(argv[i + 1], "SYN") == 0 || strcmp(argv[i + 1], "NULL") == 0 || 
                 strcmp(argv[i + 1], "FIN") == 0 || strcmp(argv[i + 1], "XMAS") == 0 || 
                     strcmp(argv[i + 1], "ACK") == 0 || strcmp(argv[i + 1], "UDP") == 0)
                     nmap.opts.scan = argv[i + 1];
@@ -1578,12 +1608,16 @@ int main(int argc, char **argv)
                 }
                 printf("hostname : %s\n", argv[i+1]);
             }
+            else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
+                nmap.timeout = atoi(argv[i+1]);
+            else if (strcmp(argv[i], "--interphase") == 0 && i + 1 < argc)
+                nmap.it = argv[i+1];  
             else if (strcmp(argv[1], "--help") == 0) {
                 print_help();
                 return 0;
             }
         }
-    }
+    
     if (nmap.onePort == - 1 || nmap.opts.strP == NULL)
         return -3;
     if (nmap.opts.ip == NULL && nmap.opts.file == 0 && nmap.opts.hostname)

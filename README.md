@@ -14,8 +14,12 @@
 | **UDP**  | UDP             | **ICMP Port Unreachable** | `CLOSED`                  |
 |          |                 | réponse UDP               | `OPEN`                    |
 |          |                 | aucune réponse            | `OPEN\|FILTERED`          |
+
+
 list des fonctions 
-jfarchic 
+
+#jfarchic 
+
 result_to_string()
 
 reconstruct_tcp()
@@ -34,7 +38,8 @@ get_port_conclusion()
 
 is_port_open()
 
-ksongbe
+#ksongbe
+
 get_service_name()
 
 checksum()
