@@ -592,7 +592,7 @@ int getInterfaceReseau(struct interphase *reseau)
             // IPv4 address
             getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
                         ip, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
-            if(strcmp(ifa->ifa_name, "eth0") == 0) {
+            if(strcmp(ifa->ifa_name, nmap.it) == 0) {
                 reseau->name = strdup(ifa->ifa_name);
                 reseau->ip = strdup(ip);
             }
@@ -1148,9 +1148,24 @@ void scantcp(int port, int scan)
     struct pcap_pkthdr *header;
     const u_char *packet;
     int ret;
+    struct timeval start;
+    struct timeval now;
+    long elapsed_ms;
+    gettimeofday(&start, NULL);
    // printf("Waiting for response...\n");
     while (1)
     {
+        gettimeofday(&now, NULL);
+
+        elapsed_ms =
+            (now.tv_sec - start.tv_sec) * 1000L +
+            (now.tv_usec - start.tv_usec) / 1000L;
+
+        if (elapsed_ms >= nmap.timeout)
+        {
+            //printf("UDP port %d is OPEN|FILTERED\n", port);
+            break;
+        }
         ret = pcap_next_ex(handle, &header, &packet);
 
         if (ret == -1)
@@ -1163,7 +1178,7 @@ void scantcp(int port, int scan)
         if (ret == 0)
         {
            // printf("Timeout\n");
-            break;
+            continue;;
         }
 
      //   printf("Packet captured: %u bytes\n", header->caplen);
@@ -1386,6 +1401,7 @@ void scanManager()
 
 void print_help(void)
 {
+    printf("ft_nmap - A simple network scanner\n");
     printf("ft_nmap [OPTIONS]\n");
     printf("--help Print this help screen\n");
     printf("--ports ports to scan (eg: 1-10, or 1 or 42)\n");
@@ -1393,6 +1409,8 @@ void print_help(void)
     printf("--file File name containing IP addresses to scan\n");
     printf("--speedup [250 max] number of parallel threads\n");
     printf("--scan SYN/NULL/FIN/XMAS/ACK/UDP\n");
+    printf("--hostname hostname to scan\n");
+    printf("--timeout timeout in ms (default 700ms)\n");
 }
 
 void ip_in_file()
@@ -1469,7 +1487,7 @@ int main(int argc, char **argv)
     nmap.opts.ip = NULL;
     nmap.opts.hostname = NULL;
     nmap.os = 1;
-    nmap.timeout = 100;
+    nmap.timeout = 700;
     nmap.it = "eth0";
     if (argc < 2) {
         print_help();
@@ -1610,14 +1628,14 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
                 nmap.timeout = atoi(argv[i+1]);
-            else if (strcmp(argv[i], "--interphase") == 0 && i + 1 < argc)
+            else if (strcmp(argv[i], "--it") == 0 && i + 1 < argc)
                 nmap.it = argv[i+1];  
             else if (strcmp(argv[1], "--help") == 0) {
                 print_help();
                 return 0;
             }
         }
-    
+    }
     if (nmap.onePort == - 1 || nmap.opts.strP == NULL)
         return -3;
     if (nmap.opts.ip == NULL && nmap.opts.file == 0 && nmap.opts.hostname)
